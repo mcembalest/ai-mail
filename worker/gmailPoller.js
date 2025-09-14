@@ -18,6 +18,7 @@ if (!IMAP_USER || !IMAP_PASS) {
 }
 
 const INTERVAL = Number(POLL_INTERVAL_MS) || 10000;
+const RECONNECT_DELAY_MS = Number(process.env.IMAP_RECONNECT_MS || "5000");
 
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
@@ -81,40 +82,61 @@ async function pollOnce(client) {
   }
 }
 
-async function run() {
-  const client = new ImapFlow({
+function createImapClient() {
+  return new ImapFlow({
     host: "imap.gmail.com",
     port: 993,
     secure: true,
+    // Keep the socket alive and allow auto IDLE between operations
+    socketTimeout: 5 * 60 * 1000, // 5 minutes
+    maxIdleTime: 15 * 60 * 1000, // restart IDLE every 15 minutes
+    missingIdleCommand: "NOOP",
     auth: {
       user: IMAP_USER,
       pass: IMAP_PASS,
     },
     logger: false,
   });
+}
 
-  client.on("error", (err) => {
-    console.error("[poller] IMAP error:", err);
-  });
+async function run() {
+  // Outer reconnect loop: if the connection drops, reconnect with backoff
+  for (;;) {
+    const client = createImapClient();
+    let closed = false;
 
-  try {
-    await client.connect();
-    console.log("[poller] Connected to Gmail IMAP as", IMAP_USER);
+    client.on("error", (err) => {
+      console.error("[poller] IMAP error:", err);
+      closed = true;
+    });
+    client.on("close", () => {
+      closed = true;
+    });
 
-    while (true) {
-      try {
-        await pollOnce(client);
-      } catch (err) {
-        console.error("[poller] Poll error:", err);
-      }
-      await sleep(INTERVAL);
-    }
-  } catch (err) {
-    console.error("[poller] Fatal error:", err);
-  } finally {
     try {
-      await client.logout();
-    } catch (e) {}
+      await client.connect();
+      console.log("[poller] Connected to Gmail IMAP as", IMAP_USER);
+
+      while (client.usable && !closed) {
+        try {
+          await pollOnce(client);
+        } catch (err) {
+          console.error("[poller] Poll error:", err);
+        }
+        await sleep(INTERVAL);
+      }
+    } catch (err) {
+      console.error("[poller] Fatal error:", err);
+    } finally {
+      try {
+        await client.logout();
+      } catch (e) {}
+    }
+
+    console.log(
+      `[poller] Disconnected. Reconnecting in ${RECONNECT_DELAY_MS}ms...`
+    );
+    await sleep(RECONNECT_DELAY_MS);
   }
 }
 
